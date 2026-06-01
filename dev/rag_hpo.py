@@ -224,9 +224,12 @@ def clean_text(txt: str) -> str:
 
 
 def clean_note(text: str) -> str:
-    text = text.encode("latin1", errors="ignore").decode("utf-8", errors="ignore")
+    # Only apply latin1 mojibake fix for text that looks ASCII/latin1;
+    # skip for Unicode text (Chinese, etc.) which would be destroyed.
+    if all(ord(c) < 256 for c in text):
+        text = text.encode("latin1", errors="ignore").decode("utf-8", errors="ignore")
     text = unicodedata.normalize("NFKD", text)
-    text = re.sub(r"[^\x00-\x7F]+", " ", text)
+    text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 

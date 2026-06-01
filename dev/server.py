@@ -12,32 +12,34 @@ import time
 import threading
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 
 try:
     from config import settings
     from schemas import (
         ExtractRequest,
-        ExtractResponse,
+        RunResponse,
         JobStatus,
         HealthResponse,
         ResultItem,
+        utcnow,
     )
 except ImportError:
     from dev.config import settings
     from dev.schemas import (
         ExtractRequest,
-        ExtractResponse,
+        RunResponse,
         JobStatus,
         HealthResponse,
         ResultItem,
+        utcnow,
     )
 
 # ── Globals ────────────────────────────────────────────────────────
 
 _pipeline = None
-_jobs: dict[str, dict] = {}  # job_id → {status, results, error, ...}
+_jobs: dict[str, dict] = {}
 _lock = threading.Lock()
 
 # ── Lifespan ───────────────────────────────────────────────────────
@@ -45,7 +47,6 @@ _lock = threading.Lock()
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Load models on startup, clean up on shutdown."""
     global _pipeline
 
     try:
@@ -55,7 +56,6 @@ async def lifespan(app: FastAPI):
         from dev.rag_hpo import LLMClient
         from dev.pipeline import Pipeline
 
-    # Build LLM client from settings
     llm = LLMClient(
         api_key=settings.api_key,
         base_url=settings.base_url,
@@ -91,69 +91,151 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# ── Helpers ────────────────────────────────────────────────────────
+
+
+def _base_url(req: Request) -> str:
+    """Reconstruct the base URL from the incoming request."""
+    return str(req.base_url).rstrip("/")
+
+
+def _build_job_urls(job_id: str, base: str) -> dict:
+    return {
+        "status_url": f"{base}/runs/{job_id}",
+        "result_url": f"{base}/runs/{job_id}/result",
+        "log_url": f"{base}/runs/{job_id}/log",
+    }
+
+
+def _queued_jobs() -> int:
+    return sum(1 for j in _jobs.values() if j["status"] == "queued")
+
+
 # ── Endpoints ──────────────────────────────────────────────────────
 
 
 @app.get("/api/v1/health", response_model=HealthResponse)
 async def health():
-    return HealthResponse(
-        status="ok",
-        model_loaded=_pipeline is not None and _pipeline.is_ready,
-        queue_size=sum(1 for j in _jobs.values() if j["status"] == "processing"),
-    )
+    return HealthResponse(status="ok", model_loaded=_pipeline is not None and _pipeline.is_ready, queue_size=_queued_jobs())
 
 
-@app.post("/api/v1/extract", response_model=ExtractResponse, status_code=202)
-async def extract(req: ExtractRequest):
-    """Submit clinical notes for HPO extraction. Returns a job_id to poll."""
+# ── Submit ─────────────────────────────────────────────────────────
+
+
+@app.post("/runs", response_model=RunResponse, status_code=202)
+@app.post("/api/v1/extract", response_model=RunResponse, status_code=202)
+async def create_run(req: ExtractRequest, request: Request):
+    """Submit clinical notes for HPO extraction. Returns a job descriptor."""
     if _pipeline is None or not _pipeline.is_ready:
-        raise HTTPException(503, "Pipeline not initialized yet. Try again shortly.")
+        raise HTTPException(503, "Pipeline not initialized yet.")
 
-    job_id = str(uuid.uuid4())[:8]
+    job_id = str(uuid.uuid4())
     notes = [n.model_dump() for n in req.notes]
+    now = utcnow()
+    base = _base_url(request)
+    input_bytes = sum(len(n["clinical_note"].encode("utf-8")) for n in notes)
+
+    job_meta = {
+        "job_id": job_id,
+        "status": "queued",
+        "created_at": now,
+        "updated_at": now,
+        "input_filename": req.input_filename,
+        "input_bytes": input_bytes,
+        "options": {},
+        "notes_count": len(notes),
+        "rows": None,
+        "results": None,
+        "elapsed_seconds": None,
+        "error": None,
+        **_build_job_urls(job_id, base),
+    }
 
     with _lock:
-        _jobs[job_id] = {
-            "status": "processing",
-            "notes_count": len(notes),
-            "results": None,
-            "elapsed_seconds": None,
-            "error": None,
-        }
+        _jobs[job_id] = job_meta
 
     thread = threading.Thread(target=_run_job, args=(job_id, notes), daemon=True)
     thread.start()
 
-    return ExtractResponse(job_id=job_id, status="processing", notes_count=len(notes))
+    return RunResponse(**job_meta)
 
 
+# ── Status ──────────────────────────────────────────────────────────
+
+
+@app.get("/runs/{job_id}", response_model=JobStatus)
 @app.get("/api/v1/jobs/{job_id}", response_model=JobStatus)
-async def get_job_status(job_id: str):
-    """Get the status and (if done) results of an extraction job."""
+async def get_run(job_id: str, request: Request):
+    """Get the status (and, when finished, results) of a job."""
     with _lock:
         job = _jobs.get(job_id)
     if job is None:
         raise HTTPException(404, f"Job '{job_id}' not found.")
-    return JobStatus(job_id=job_id, **job)
+
+    base = _base_url(request)
+    urls = _build_job_urls(job_id, base)
+    return JobStatus(**{**job, **urls})
 
 
-# ── Helpers ────────────────────────────────────────────────────────
+# ── Result ──────────────────────────────────────────────────────────
+
+
+@app.get("/runs/{job_id}/result")
+@app.get("/api/v1/jobs/{job_id}/result")
+async def get_run_result(job_id: str):
+    """Get only the results of a completed job."""
+    with _lock:
+        job = _jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, f"Job '{job_id}' not found.")
+    if job["status"] == "queued":
+        raise HTTPException(425, "Job still queued. Try again later.")
+    if job["status"] == "failure":
+        raise HTTPException(422, job.get("error", "Job failed."))
+    return {"job_id": job_id, "status": job["status"], "results": job.get("results", [])}
+
+
+# ── Log ─────────────────────────────────────────────────────────────
+
+
+@app.get("/runs/{job_id}/log")
+@app.get("/api/v1/jobs/{job_id}/log")
+async def get_run_log(job_id: str):
+    """Get a minimal execution log for a job."""
+    with _lock:
+        job = _jobs.get(job_id)
+    if job is None:
+        raise HTTPException(404, f"Job '{job_id}' not found.")
+    return {
+        "job_id": job_id,
+        "status": job["status"],
+        "created_at": job.get("created_at"),
+        "updated_at": job.get("updated_at"),
+        "elapsed_seconds": job.get("elapsed_seconds"),
+        "error": job.get("error"),
+    }
+
+
+# ── Background runner ───────────────────────────────────────────────
 
 
 def _run_job(job_id: str, notes: list[dict]):
-    """Process a batch of notes in a background thread."""
     t0 = time.time()
     try:
         results = _pipeline.run(notes)
         items = [ResultItem(**r) for r in results]
     except Exception as exc:
         with _lock:
-            _jobs[job_id]["status"] = "failed"
+            _jobs[job_id]["status"] = "failure"
             _jobs[job_id]["error"] = str(exc)
+            _jobs[job_id]["updated_at"] = utcnow()
         return
 
     elapsed = time.time() - t0
     with _lock:
-        _jobs[job_id]["status"] = "done"
+        _jobs[job_id]["status"] = "completed"
         _jobs[job_id]["results"] = [i.model_dump() for i in items]
+        _jobs[job_id]["rows"] = len(items)
         _jobs[job_id]["elapsed_seconds"] = round(elapsed, 1)
+        _jobs[job_id]["updated_at"] = utcnow()

@@ -6,3 +6,12 @@ __pycache__/
 LLaMa-4-Scout.flag
 temp_*.pkl
 .DS_Store
+
+# Large data files (tracked separately or generated)
+hp.obo
+hpo_meta.json
+hpo_embedded.npz
+hpo_terms_full.csv
+
+# Temp output
+dev/tmp/*.csv
