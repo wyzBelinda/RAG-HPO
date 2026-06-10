@@ -40,35 +40,53 @@ except ImportError:
 
 # ── Globals ────────────────────────────────────────────────────────
 
-_JOBS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                          settings.jobs_file)
+_JOBS_DIR = settings.jobs_dir
 
 _pipeline = None
 _jobs: dict[str, dict] = {}
 _lock = threading.Lock()
 
 
-def _save_jobs():
-    """Persist _jobs to disk. Call while holding _lock."""
+def _job_dir(job_id: str) -> str:
+    return os.path.join(_JOBS_DIR, job_id)
+
+
+def _job_path(job_id: str) -> str:
+    return os.path.join(_job_dir(job_id), "job.json")
+
+
+def _save_job(job_id: str):
+    """Persist a single job to disk. Call while holding _lock."""
+    job = _jobs.get(job_id)
+    if job is None:
+        return
     try:
-        with open(_JOBS_FILE, "w", encoding="utf-8") as f:
-            json.dump(_jobs, f, ensure_ascii=False, indent=2)
+        os.makedirs(_job_dir(job_id), exist_ok=True)
+        with open(_job_path(job_id), "w", encoding="utf-8") as f:
+            json.dump(job, f, ensure_ascii=False, indent=2)
     except OSError as exc:
-        print(f"[WARN] Could not save jobs: {exc}")
+        print(f"[WARN] Could not save job {job_id}: {exc}")
 
 
 def _load_jobs():
     """Restore _jobs from disk. Call before accepting requests."""
-    if not os.path.exists(_JOBS_FILE):
+    if not os.path.isdir(_JOBS_DIR):
         return
-    try:
-        with open(_JOBS_FILE, "r", encoding="utf-8") as f:
-            restored = json.load(f)
-        if isinstance(restored, dict):
-            _jobs.update(restored)
-            print(f"[INFO] Restored {len(restored)} job(s) from {_JOBS_FILE}")
-    except (json.JSONDecodeError, OSError) as exc:
-        print(f"[WARN] Could not load jobs from {_JOBS_FILE}: {exc}")
+    count = 0
+    for entry in os.listdir(_JOBS_DIR):
+        jp = os.path.join(_JOBS_DIR, entry, "job.json")
+        if not os.path.isfile(jp):
+            continue
+        try:
+            with open(jp, "r", encoding="utf-8") as f:
+                job = json.load(f)
+            if isinstance(job, dict) and "job_id" in job:
+                _jobs[job["job_id"]] = job
+                count += 1
+        except (json.JSONDecodeError, OSError) as exc:
+            print(f"[WARN] Could not load {jp}: {exc}")
+    if count:
+        print(f"[INFO] Restored {count} job(s) from {_JOBS_DIR}")
 
 # ── Lifespan ───────────────────────────────────────────────────────
 
@@ -100,8 +118,6 @@ async def lifespan(app: FastAPI):
     print("Pipeline ready — models loaded, FAISS index built.")
 
     yield
-
-    print("Shutting down.")
 
     print("Shutting down.")
 
@@ -185,7 +201,7 @@ async def create_run(req: ExtractRequest, request: Request):
 
     with _lock:
         _jobs[job_id] = job_meta
-        _save_jobs()
+        _save_job(job_id)
 
     thread = threading.Thread(target=_run_job, args=(job_id, notes), daemon=True)
     thread.start()
@@ -262,7 +278,7 @@ def _run_job(job_id: str, notes: list[dict]):
             _jobs[job_id]["status"] = "failure"
             _jobs[job_id]["error"] = str(exc)
             _jobs[job_id]["updated_at"] = utcnow()
-            _save_jobs()
+            _save_job(job_id)
         return
 
     elapsed = time.time() - t0
@@ -272,4 +288,4 @@ def _run_job(job_id: str, notes: list[dict]):
         _jobs[job_id]["rows"] = len(items)
         _jobs[job_id]["elapsed_seconds"] = round(elapsed, 1)
         _jobs[job_id]["updated_at"] = utcnow()
-        _save_jobs()
+        _save_job(job_id)
