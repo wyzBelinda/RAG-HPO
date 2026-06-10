@@ -7,6 +7,8 @@ Start with:
 
 from __future__ import annotations
 
+import os
+import json
 import uuid
 import time
 import threading
@@ -38,9 +40,35 @@ except ImportError:
 
 # ── Globals ────────────────────────────────────────────────────────
 
+_JOBS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          settings.jobs_file)
+
 _pipeline = None
 _jobs: dict[str, dict] = {}
 _lock = threading.Lock()
+
+
+def _save_jobs():
+    """Persist _jobs to disk. Call while holding _lock."""
+    try:
+        with open(_JOBS_FILE, "w", encoding="utf-8") as f:
+            json.dump(_jobs, f, ensure_ascii=False, indent=2)
+    except OSError as exc:
+        print(f"[WARN] Could not save jobs: {exc}")
+
+
+def _load_jobs():
+    """Restore _jobs from disk. Call before accepting requests."""
+    if not os.path.exists(_JOBS_FILE):
+        return
+    try:
+        with open(_JOBS_FILE, "r", encoding="utf-8") as f:
+            restored = json.load(f)
+        if isinstance(restored, dict):
+            _jobs.update(restored)
+            print(f"[INFO] Restored {len(restored)} job(s) from {_JOBS_FILE}")
+    except (json.JSONDecodeError, OSError) as exc:
+        print(f"[WARN] Could not load jobs from {_JOBS_FILE}: {exc}")
 
 # ── Lifespan ───────────────────────────────────────────────────────
 
@@ -68,9 +96,12 @@ async def lifespan(app: FastAPI):
 
     _pipeline = Pipeline()
     _pipeline.initialize(llm)
+    _load_jobs()
     print("Pipeline ready — models loaded, FAISS index built.")
 
     yield
+
+    print("Shutting down.")
 
     print("Shutting down.")
 
@@ -154,6 +185,7 @@ async def create_run(req: ExtractRequest, request: Request):
 
     with _lock:
         _jobs[job_id] = job_meta
+        _save_jobs()
 
     thread = threading.Thread(target=_run_job, args=(job_id, notes), daemon=True)
     thread.start()
@@ -230,6 +262,7 @@ def _run_job(job_id: str, notes: list[dict]):
             _jobs[job_id]["status"] = "failure"
             _jobs[job_id]["error"] = str(exc)
             _jobs[job_id]["updated_at"] = utcnow()
+            _save_jobs()
         return
 
     elapsed = time.time() - t0
@@ -239,3 +272,4 @@ def _run_job(job_id: str, notes: list[dict]):
         _jobs[job_id]["rows"] = len(items)
         _jobs[job_id]["elapsed_seconds"] = round(elapsed, 1)
         _jobs[job_id]["updated_at"] = utcnow()
+        _save_jobs()

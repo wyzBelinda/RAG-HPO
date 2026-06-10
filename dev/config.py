@@ -16,6 +16,7 @@ class Settings(BaseSettings):
     vec_path: str = "hpo_embedded.npz"
     temp_dir: str = "tmp"
     hpo_terms_csv: str = "hpo_terms_full.csv"
+    jobs_file: str = "jobs.json"
     obo_url: str = "https://purl.obolibrary.org/obo/hp.obo"
     obo_path: str = "hp.obo"
     obo_refresh_days: int = 14
