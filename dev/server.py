@@ -306,12 +306,13 @@ def _run_job(job_id: str, notes: list[dict]):
         _save_job(job_id)
 
     # Write export files alongside job.json
-    _write_export_files(job_id, items)
+    note_map = {n["patient_id"]: n["clinical_note"] for n in notes}
+    _write_export_files(job_id, items, note_map)
 
 
-def _write_export_files(job_id: str, items: list[ResultItem]):
+def _write_export_files(job_id: str, items: list[ResultItem], note_map: dict[str, str]):
     """Write hpo_ids.txt and phenotypes.tsv to the job directory."""
-    import csv, io
+    import csv
     jd = _job_dir(job_id)
     os.makedirs(jd, exist_ok=True)
 
@@ -321,5 +322,6 @@ def _write_export_files(job_id: str, items: list[ResultItem]):
 
     with open(os.path.join(jd, "phenotypes.tsv"), "w", newline="") as f:
         w = csv.writer(f, delimiter="\t")
-        for h, p in [(i.hpo_id, i.phrase) for i in items if i.hpo_id]:
-            w.writerow([h, p])
+        for i in items:
+            if i.hpo_id:
+                w.writerow([i.hpo_id, note_map.get(i.patient_id, "")])
