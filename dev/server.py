@@ -322,6 +322,8 @@ def _write_export_files(job_id: str, items: list[ResultItem], note_map: dict[str
 
     with open(os.path.join(jd, "phenotypes.tsv"), "w", newline="") as f:
         w = csv.writer(f, delimiter="\t")
+        seen_pid = set()
         for i in items:
-            if i.hpo_id:
-                w.writerow([i.hpo_id, note_map.get(i.patient_id, "")])
+            if i.patient_id not in seen_pid:
+                w.writerow([i.patient_id, note_map.get(i.patient_id, "")])
+                seen_pid.add(i.patient_id)

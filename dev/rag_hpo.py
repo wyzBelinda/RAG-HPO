@@ -682,7 +682,7 @@ def validate_input(df):
         df = df.reset_index(drop=True)
         df["patient_id"] = df.index + 1
     else:
-        df["patient_id"] = df["patient_id"].astype(int)
+        df["patient_id"] = df["patient_id"].astype(str)
     return df
 
 
