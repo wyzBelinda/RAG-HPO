@@ -52,6 +52,7 @@ class Settings(BaseSettings):
     checkpoint_interval_notes: int = 5
     checkpoint_interval_hpo: int = 50
     hpo_embedding_precision: str = "float16"
+    pipeline_max_workers: int = 20
 
     # ── OLS API ──
     ols_iri_template: str = "http://purl.obolibrary.org/obo/{id}"

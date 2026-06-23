@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import os
+import re
 import sys
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Optional
 
 import numpy as np
@@ -17,10 +19,6 @@ try:
 except ImportError:
     from dev.config import settings
     from dev.http_utils import build_retry_session, request_with_retry
-
-# ── Reuse core functions from rag_hpo ──
-# These are imported at module level; they need llm_client passed explicitly
-# where the original used a module-level global.
 
 
 class Pipeline:
@@ -71,6 +69,29 @@ class Pipeline:
     def is_ready(self) -> bool:
         return self.llm_client is not None and self.emb_model is not None
 
+    # ── Translation ─────────────────────────────────────────────────
+
+    _CJK_RE = re.compile(r"[一-鿿㐀-䶿豈-﫿]")
+    _TRANSLATE_SYSTEM = (
+        "You are a clinical translator. "
+        "Translate the following clinical note into precise medical English. "
+        "Preserve every symptom, sign, measurement, diagnosis, and anatomical detail. "
+        "Return ONLY the English translation, nothing else — no explanations, no notes."
+    )
+
+    def _translate_note(self, note: str) -> str:
+        """Translate a non-English clinical note to English via LLM."""
+        if not self._CJK_RE.search(note):
+            return note
+        try:
+            translated = self.llm_client.query(note, self._TRANSLATE_SYSTEM)
+            # Guard: if LLM returned empty or still non-English, fall back
+            if translated and len(translated.strip()) > 20:
+                return translated.strip()
+        except Exception:
+            pass
+        return note
+
     # ── Pipeline entry point ────────────────────────────────────────
 
     def run(self, notes: list[dict]) -> list[dict]:
@@ -115,18 +136,28 @@ class Pipeline:
         df_input = pd.DataFrame(notes)
         df_input = validate_input(df_input)
 
-        # 2) Stage I — LLM phenotype extraction
+        # 2) Stage I — LLM phenotype extraction (parallel per note)
         combined = pd.DataFrame()
         pids = sorted(df_input["patient_id"].unique())
-        for pid in pids:
+        max_workers = min(settings.pipeline_max_workers, len(pids))
+
+        def _process_one(pid):
             note = df_input.loc[df_input["patient_id"] == pid, "clinical_note"].iloc[0]
+            note = self._translate_note(note)
             res = process_row(
                 note, system_I, self.emb_model, self.index, self.docs,
                 llm_client=self.llm_client,
             )
             if not res.empty:
                 res["patient_id"] = pid
-                combined = pd.concat([combined, res], ignore_index=True)
+            return res
+
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_process_one, pid): pid for pid in pids}
+            for future in as_completed(futures):
+                res = future.result()
+                if not res.empty:
+                    combined = pd.concat([combined, res], ignore_index=True)
 
         if combined.empty:
             return []
@@ -146,36 +177,52 @@ class Pipeline:
         )
         exact_df, non_exact_df = split_exact_nonexact(combined, hpo_term_col="HPO_Term")
 
-        # 4) Stage II — LLM HPO mapping for non-exact entries
+        # 4) Stage II — LLM HPO mapping for non-exact entries (parallel)
         non_ex = non_exact_df.copy()
-        idxs = non_ex[
+        idxs = list(non_ex[
             (non_ex["category"] == "Abnormal")
             & (non_ex["HPO_Term"].isna())
-        ].index
+        ].index)
 
-        for idx in idxs:
-            row_df = non_ex.loc[[idx]]
-            out_df = generate_hpo_terms(
-                row_df, system_II, llm_client=self.llm_client,
-            )
-            hp = out_df.at[0, "HPO_Terms"][0]["HPO_Term"] if not out_df.empty else None
-            non_ex.at[idx, "HPO_Term"] = hp or "No Candidate Fit"
+        if idxs:
+            max_workers_ii = min(settings.pipeline_max_workers, len(idxs))
 
-        # 5) Compile final
+            def _map_one(idx):
+                row_df = non_ex.loc[[idx]]
+                out_df = generate_hpo_terms(
+                    row_df, system_II, llm_client=self.llm_client,
+                )
+                hp = out_df.at[0, "HPO_Terms"][0]["HPO_Term"] if not out_df.empty else None
+                return idx, hp or "No Candidate Fit"
+
+            with ThreadPoolExecutor(max_workers=max_workers_ii) as executor:
+                futures = {executor.submit(_map_one, idx): idx for idx in idxs}
+                for future in as_completed(futures):
+                    idx, hp = future.result()
+                    non_ex.at[idx, "HPO_Term"] = hp
+
+        # 5) Compile final, deduplicate by (patient_id, hpo_id)
         merged = pd.concat([exact_df, non_ex], ignore_index=True)
         merged = merged.dropna(subset=["HPO_Term"])
 
+        seen = set()
         results = []
         for _, r in merged.iterrows():
-            pid = r.get("patient_id")
+            pid = str(r.get("patient_id"))
             hp = r.get("HPO_Term") or ""
             if isinstance(hp, str):
                 hp = hp.replace("HP:HP:", "HP:")
+            if not hp or hp == "No Candidate Fit":
+                continue
+            key = (pid, hp)
+            if key in seen:
+                continue
+            seen.add(key)
             results.append({
-                "patient_id": str(pid),
+                "patient_id": pid,
                 "phrase": r.get("phrase", ""),
                 "category": r.get("category", ""),
-                "hpo_id": hp if hp else None,
+                "hpo_id": hp,
             })
 
         elapsed = time.time() - t0
