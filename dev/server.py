@@ -265,6 +265,21 @@ async def get_run_log(job_id: str):
     }
 
 
+# ── Download ────────────────────────────────────────────────────────
+
+from fastapi.responses import FileResponse
+
+
+@app.get("/runs/{job_id}/download/{filename}")
+@app.get("/api/v1/jobs/{job_id}/download/{filename}")
+async def download_file(job_id: str, filename: str):
+    """Download an export file (hpo_ids.txt or phenotypes.tsv)."""
+    path = os.path.join(_job_dir(job_id), filename)
+    if not os.path.isfile(path):
+        raise HTTPException(404, f"File '{filename}' not found for job '{job_id}'.")
+    return FileResponse(path, filename=filename, media_type="application/octet-stream")
+
+
 # ── Background runner ───────────────────────────────────────────────
 
 
@@ -289,3 +304,22 @@ def _run_job(job_id: str, notes: list[dict]):
         _jobs[job_id]["elapsed_seconds"] = round(elapsed, 1)
         _jobs[job_id]["updated_at"] = utcnow()
         _save_job(job_id)
+
+    # Write export files alongside job.json
+    _write_export_files(job_id, items)
+
+
+def _write_export_files(job_id: str, items: list[ResultItem]):
+    """Write hpo_ids.txt and phenotypes.tsv to the job directory."""
+    import csv, io
+    jd = _job_dir(job_id)
+    os.makedirs(jd, exist_ok=True)
+
+    hpo_ids = [i.hpo_id for i in items if i.hpo_id and i.hpo_id != "No Candidate Fit"]
+    with open(os.path.join(jd, "hpo_ids.txt"), "w") as f:
+        f.write("\n".join(hpo_ids) + "\n")
+
+    with open(os.path.join(jd, "phenotypes.tsv"), "w", newline="") as f:
+        w = csv.writer(f, delimiter="\t")
+        for h, p in [(i.hpo_id, i.phrase) for i in items if i.hpo_id]:
+            w.writerow([h, p])
